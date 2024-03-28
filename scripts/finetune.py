@@ -8,11 +8,15 @@ import flax
 from flax.traverse_util import flatten_dict
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec as P
+from jax.experimental import mesh_utils
+from jax.experimental.shard_map import shard_map
 from ml_collections import config_flags, ConfigDict
 import optax
 import tensorflow as tf
 import tqdm
 import wandb
+
 
 from octo.data.dataset import make_single_dataset
 from octo.model.octo_model import OctoModel
@@ -91,6 +95,8 @@ def main(_):
 
     # create a 1D mesh with a single axis named "batch"
     mesh = Mesh(jax.devices(), axis_names="batch")
+    print(f'DEBUG mesh={mesh}')
+
     # Our batches will be data-parallel sharded -- each device will get a slice of the batch
     dp_sharding = NamedSharding(mesh, PartitionSpec("batch"))
     # Our model will be replicated across devices (we are only doing data parallelism, not model parallelism)
@@ -291,9 +297,16 @@ def main(_):
 
     # Data parallelism
     # Model is replicated across devices, data is split across devices
+    @jax.jit
     @partial(
-        jax.jit,
-        in_shardings=[replicated_sharding, dp_sharding],
+        shard_map,
+        mesh=mesh,
+        # NOTE The 'batch' parameter of train_step should be sharded in the "batch" axis of the mesh
+        # NOTE state parameter and outputs are not sharded (i.e., they are replicated)
+        in_specs=(P(), P("batch")),
+        out_specs=(P(), P()),
+        # NotImplementedError: No replication rule for erf_inv. As a workaround, pass the `check_rep=False` argument to `shard_map`
+        check_rep=False
     )
     def train_step(state, batch):
         rng, dropout_rng = jax.random.split(state.rng)
@@ -423,4 +436,29 @@ def main(_):
 
 
 if __name__ == "__main__":
+    import os
+
+    world_size = int(os.environ.get('OMPI_COMM_WORLD_SIZE') or 1)
+    world_rank = int(os.environ.get('OMPI_COMM_WORLD_RANK') or 0)
+    coordinator_address = os.environ.get('COORDINATOR_ADDRESS')
+    print(f'DEBUG rank={world_rank} world_size={world_size}')
+    print(f'DEBUG rank={world_rank} coordinator_address = {coordinator_address}')
+
+    # DEBUG
+    jax.clear_caches()
+
+    jax.distributed.initialize(
+        coordinator_address=coordinator_address,
+        num_processes=world_size,
+        process_id=world_rank,
+        # FIXME needed to have it detect all GPUs
+        local_device_ids=range(4)
+    )
+
+    print(f'DEBUG rank={world_rank} jax.device_count()={jax.device_count()}')
+    print(f'DEBUG rank={world_rank} jax.local_device_count()={jax.local_device_count()}')
+    print(f'DEBUG rank={world_rank} jax.devices()={jax.devices()}')
+
     app.run(main)
+
+    jax.distributed.shutdown()

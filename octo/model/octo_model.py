@@ -141,6 +141,7 @@ class OctoModel:
             pad_mask: (batch_size, window_size) Boolean mask that is False when the timestep corresponds to padding
             train: whether to run in train mode
         """
+
         _verify_shapes(
             observations,
             "observations",
@@ -257,6 +258,7 @@ class OctoModel:
 
         # create model def (an OctoModule)
         module = OctoModule.create(**config["model"])
+
         # infer params shape without actually doing any computation
         params_shape = jax.eval_shape(
             partial(module.init, train=False),
@@ -369,7 +371,8 @@ class OctoModel:
         """
         module = OctoModule.create(**config["model"])
         rng = rng if rng is not None else jax.random.PRNGKey(0)
-        example_batch = multihost_utils.process_allgather(example_batch)
+        # NOTE do not add a new dimension in front
+        example_batch = multihost_utils.process_allgather(example_batch, tiled=True)
         example_batch = jax.tree_map(lambda x: x[:1], example_batch)
 
         init_args = (
