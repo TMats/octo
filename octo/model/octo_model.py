@@ -369,7 +369,7 @@ class OctoModel:
         """
         module = OctoModule.create(**config["model"])
         rng = rng if rng is not None else jax.random.PRNGKey(0)
-        example_batch = multihost_utils.process_allgather(example_batch)
+        example_batch = multihost_utils.process_allgather(example_batch, tiled=True)
         example_batch = jax.tree_map(lambda x: x[:1], example_batch)
 
         init_args = (
