@@ -22,7 +22,8 @@ import numpy as np
 from widowx_envs.widowx_env_service import WidowXClient, WidowXConfigs, WidowXStatus
 
 from octo.model.octo_model import OctoModel
-from octo.utils.gym_wrappers import HistoryWrapper, RHCWrapper, UnnormalizeActionProprio
+from octo.utils.gym_wrappers import HistoryWrapper, TemporalEnsembleWrapper
+from octo.utils.train_callbacks import supply_rng
 
 np.set_printoptions(suppress=True)
 
@@ -46,9 +47,10 @@ flags.DEFINE_bool("blocking", False, "Use the blocking controller")
 flags.DEFINE_integer("im_size", None, "Image size", required=True)
 flags.DEFINE_string("video_save_path", None, "Path to save video")
 flags.DEFINE_integer("num_timesteps", 120, "num timesteps")
-flags.DEFINE_integer("horizon", 1, "Observation history length")
-flags.DEFINE_integer("pred_horizon", 1, "Length of action sequence from model")
-flags.DEFINE_integer("exec_horizon", 1, "Length of action sequence to execute")
+flags.DEFINE_integer("window_size", 2, "Observation history length")
+flags.DEFINE_integer(
+    "action_horizon", 4, "Length of action sequence to execute/ensemble"
+)
 
 
 # show image flag
@@ -60,10 +62,9 @@ STEP_DURATION_MESSAGE = """
 Bridge data was collected with non-blocking control and a step duration of 0.2s.
 However, we relabel the actions to make it look like the data was collected with
 blocking control and we evaluate with blocking control.
-We also use a step duration of 0.4s to reduce the jerkiness of the policy.
-Be sure to change the step duration back to 0.2 if evaluating with non-blocking control.
+Be sure to use a step duration of 0.2 if evaluating with non-blocking control.
 """
-STEP_DURATION = 0.4
+STEP_DURATION = 0.2
 STICKY_GRIPPER_NUM_STEPS = 1
 WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
 CAMERA_TOPICS = [{"name": "/blue/image_raw"}]
@@ -87,7 +88,7 @@ def main(_):
 
     env_params = WidowXConfigs.DefaultEnvParams.copy()
     env_params.update(ENV_PARAMS)
-    env_params["state_state"] = list(start_state)
+    env_params["start_state"] = list(start_state)
     widowx_client = WidowXClient(host=FLAGS.ip, port=FLAGS.port)
     widowx_client.init(env_params, image_size=FLAGS.im_size)
     env = WidowXGym(
@@ -103,14 +104,12 @@ def main(_):
     )
 
     # wrap the robot environment
-    env = UnnormalizeActionProprio(
-        env, model.dataset_statistics, normalization_type="normal"
-    )
-    env = HistoryWrapper(env, FLAGS.horizon)
-    env = RHCWrapper(env, FLAGS.exec_horizon)
+    env = HistoryWrapper(env, FLAGS.window_size)
+    env = TemporalEnsembleWrapper(env, FLAGS.action_horizon)
+    # switch TemporalEnsembleWrapper with RHCWrapper for receding horizon control
+    # env = RHCWrapper(env, FLAGS.action_horizon)
 
     # create policy functions
-    @jax.jit
     def sample_actions(
         pretrained_model: OctoModel,
         observations,
@@ -123,15 +122,20 @@ def main(_):
             observations,
             tasks,
             rng=rng,
+            unnormalization_statistics=pretrained_model.dataset_statistics[
+                "bridge_dataset"
+            ]["action"],
         )
         # remove batch dim
         return actions[0]
 
-    policy_fn = partial(
-        sample_actions,
-        model,
-        argmax=FLAGS.deterministic,
-        temperature=FLAGS.temperature,
+    policy_fn = supply_rng(
+        partial(
+            sample_actions,
+            model,
+            argmax=FLAGS.deterministic,
+            temperature=FLAGS.temperature,
+        )
     )
 
     goal_image = jnp.zeros((FLAGS.im_size, FLAGS.im_size, 3), dtype=np.uint8)
@@ -177,11 +181,11 @@ def main(_):
         else:
             raise NotImplementedError()
 
+        input("Press [Enter] to start.")
+
         # reset env
         obs, _ = env.reset()
         time.sleep(2.0)
-
-        input("Press [Enter] to start.")
 
         # do rollout
         last_tstep = time.time()
