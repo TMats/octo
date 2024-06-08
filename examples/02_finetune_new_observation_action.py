@@ -7,8 +7,10 @@ To run this example, first download and extract the dataset from here: https://r
 python examples/02_finetune_new_observation_action.py --pretrained_path=hf://rail-berkeley/octo-small-1.5 --data_dir=...
 """
 from absl import app, flags, logging
+from functools import partial
 import flax
 import jax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import optax
 import tensorflow as tf
 import tqdm
@@ -49,6 +51,14 @@ def main(_):
     ), "Batch size must be divisible by device count."
 
     initialize_compilation_cache()
+
+    # create a 1D mesh with a single axis named "batch"
+    mesh = Mesh(jax.devices(), axis_names="batch")
+    # Our batches will be data-parallel sharded -- each device will get a slice of the batch
+    dp_sharding = NamedSharding(mesh, PartitionSpec("batch"))
+    # Our model will be replicated across devices (we are only doing data parallelism, not model parallelism)
+    replicated_sharding = NamedSharding(mesh, PartitionSpec())
+
     # prevent tensorflow from using GPU memory since it's only used for data loading
     tf.config.set_visible_devices([], "GPU")
 
@@ -171,7 +181,12 @@ def main(_):
         )
         return action_loss, action_metrics
 
-    @jax.jit
+    # Data parallelism
+    # Model is replicated across devices, data is split across devices
+    @partial(
+        jax.jit,
+        in_shardings=[replicated_sharding, dp_sharding],
+    )
     def train_step(state, batch):
         rng, dropout_rng = jax.random.split(state.rng)
         (loss, info), grads = jax.value_and_grad(loss_fn, has_aux=True)(
