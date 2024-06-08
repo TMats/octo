@@ -7,11 +7,15 @@ import flax
 from flax.traverse_util import flatten_dict
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec as P
+from jax.experimental import mesh_utils
+from jax.experimental.shard_map import shard_map
 from ml_collections import config_flags, ConfigDict
 import optax
 import tensorflow as tf
 import tqdm
 import wandb
+
 
 from octo.data.dataset import make_single_dataset
 from octo.model.octo_model import OctoModel
@@ -90,6 +94,8 @@ def main(_):
 
     # create a 1D mesh with a single axis named "batch"
     mesh = Mesh(jax.devices(), axis_names="batch")
+    print(f'DEBUG mesh={mesh}')
+
     # Our batches will be data-parallel sharded -- each device will get a slice of the batch
     dp_sharding = NamedSharding(mesh, PartitionSpec("batch"))
     # Our model will be replicated across devices (we are only doing data parallelism, not model parallelism)
@@ -103,7 +109,8 @@ def main(_):
     # Setup WandB
     #
     #########
-
+    
+    world_rank = int(os.environ.get('OMPI_COMM_WORLD_RANK') or 0)
     name = format_name_with_config(
         FLAGS.name,
         FLAGS.config.to_dict(),
@@ -112,13 +119,15 @@ def main(_):
         name=name,
         time=datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
     )
-    wandb.init(
-        config=FLAGS.config.to_dict(),
-        id=wandb_id,
-        name=name,
-        mode="disabled" if FLAGS.debug else None,
-        **FLAGS.config.wandb,
-    )
+        
+    if world_rank == 0:
+        wandb.init(
+            config=FLAGS.config.to_dict(),
+            id=wandb_id,
+            name=name,
+            mode="disabled" if FLAGS.debug else None,
+            **FLAGS.config.wandb,
+        )
 
     #########
     #
@@ -157,10 +166,15 @@ def main(_):
     else:
         text_processor = ModuleSpec.instantiate(config["text_processor"])()
 
-    def process_batch(batch):
-        batch = process_text(batch, text_processor)
-        del batch["dataset_name"]
-        return batch
+    # load standardize_fn from `path/to/file.py:fn_name` format
+    if (
+        standardize_fn := FLAGS.config["dataset_kwargs"].get("standardize_fn", None)
+    ) is not None:
+        path, name = standardize_fn.split(":")
+        # imp is deprecated, but it's also what ml_collections uses
+        standardize_fn = getattr(imp.load_source("standardize_fn", path), name)
+        del FLAGS.config["dataset_kwargs"]["standardize_fn"]
+        FLAGS.config["dataset_kwargs"]["standardize_fn"] = standardize_fn
 
     dataset = make_single_dataset(
         FLAGS.config.dataset_kwargs,
@@ -168,16 +182,73 @@ def main(_):
         frame_transform_kwargs=FLAGS.config.frame_transform_kwargs,
         train=True,
     )
+
+    def process_batch(batch):
+        batch = process_text(batch, text_processor)
+        del batch["dataset_name"]
+        return batch
+    
+    # NOTE needs to return a non-nested type for Tout
+    def encode_instruction(x):
+        decoded = [str(s, encoding='UTF-8') for s in x.numpy()]
+        encoded = text_processor.encode(decoded)
+        return (encoded['input_ids'], encoded['attention_mask'])
+    
+    def remove_name(x):
+        del x["dataset_name"]
+        return x
+
+    def replace_field(x, y):
+        x['task']['language_instruction'] = y
+        return x
+
+    def create_dict(x, input_ids, attention_mask):
+        instruction = {
+            "input_ids": tf.convert_to_tensor(input_ids),
+            "attention_mask": tf.convert_to_tensor(attention_mask)
+        }
+        return x, instruction
+
+    def replace_and_remove(x, instruction):
+        x['task']['language_instruction'] = instruction
+        del x["dataset_name"]
+        return x
+
+    def create_replace_remove(x, input_ids, attention_mask):
+        instruction = {
+            "input_ids": tf.convert_to_tensor(input_ids),
+            "attention_mask": tf.convert_to_tensor(attention_mask)
+        }
+        x['task']['language_instruction'] = instruction
+        del x["dataset_name"]
+        return x
+        
+    #d2 = (dataset
+    #    #.map(remove_name)
+    #    # NOTE Returns a tuple of three elements, need to expand the 2-tuple returned by this py_function
+    #    .map(lambda x: (x, *tf.py_function(encode_instruction, [ x['task']['language_instruction'] ], Tout=(tf.int32, tf.int32))))
+    #    #.map(create_dict)
+    #    #.map(replace_and_remove)
+    #    .map(create_replace_remove)
+    #)
+
     train_data_iter = (
+        #d2.repeat()
         dataset.repeat()
+        .map(lambda x: (x, *tf.py_function(encode_instruction, [ x['task']['language_instruction'] ], Tout=(tf.int32, tf.int32))))
+        .map(create_replace_remove)
         .unbatch()
         .shuffle(FLAGS.config.shuffle_buffer_size)
         .batch(FLAGS.config.batch_size)
         .iterator()
     )
-    train_data_iter = map(process_batch, train_data_iter)
+    # FIXME already done
+    # train_data_iter = map(process_batch, train_data_iter)
     example_batch = next(train_data_iter)
 
+    # FIXME check a single subset instead
+    #data_subset = [next(train_data_iter) for _ in range(100)]
+    
     #########
     #
     # Load Pretrained Model
@@ -230,7 +301,8 @@ def main(_):
             FLAGS.config.wandb.group or "",
             wandb_id,
         )
-        wandb.config.update(dict(save_dir=save_dir), allow_val_change=True)
+        if world_rank == 0:
+            wandb.config.update(dict(save_dir=save_dir), allow_val_change=True)
         logging.info("Saving to %s", save_dir)
         save_callback = SaveCallback(save_dir)
 
@@ -254,9 +326,11 @@ def main(_):
     example_batch_spec = jax.tree_map(
         lambda arr: (arr.shape, str(arr.dtype)), example_batch
     )
-    wandb.config.update(
-        dict(example_batch_spec=example_batch_spec), allow_val_change=True
-    )
+    
+    if world_rank == 0:
+        wandb.config.update(
+            dict(example_batch_spec=example_batch_spec), allow_val_change=True
+        )
 
     #########
     #
@@ -282,10 +356,20 @@ def main(_):
         return action_loss, action_metrics
 
     # Data parallelism
+    
+
     # Model is replicated across devices, data is split across devices
+    # NotImplementedError: Eager evaluation of a `custom_jvp` inside a `shard_map` isn't yet supported. Put a `jax.jit` around the `shard_map`-decorated function, and open a feature request at https://github.com/google/jax/issues !
+    @jax.jit
     @partial(
-        jax.jit,
-        in_shardings=[replicated_sharding, dp_sharding],
+        shard_map,
+        mesh=mesh,
+        # NOTE The 'batch' parameter of train_step should be sharded in the "batch" axis of the mesh
+        # NOTE state parameter and outputs are not sharded (i.e., they are replicated)
+        in_specs=(P(), P("batch")),
+        out_specs=(P(), P()),
+        # NotImplementedError: No replication rule for erf_inv. As a workaround, pass the `check_rep=False` argument to `shard_map`
+        check_rep=False
     )
     def train_step(state: TrainState, batch):
         rng, dropout_rng = jax.random.split(state.rng)
@@ -363,7 +447,11 @@ def main(_):
     #########
 
     def wandb_log(info, step):
-        wandb.log(flatten_dict(info, sep="/"), step=step)
+        if world_rank == 0:
+            wandb.log(flatten_dict(info, sep="/"), step=step)
+
+    # FIXME 
+    total_samples = int(FLAGS.config.num_steps * FLAGS.config.batch_size)
 
     timer = Timer()
     for i in tqdm.tqdm(
@@ -374,6 +462,8 @@ def main(_):
         timer.tick("total")
 
         with timer("dataset"):
+            # FIXME for a single subset
+            #batch = data_subset[i % (len(data_subset))]
             batch = next(train_data_iter)
 
         with timer("train"):
@@ -409,4 +499,29 @@ def main(_):
 
 
 if __name__ == "__main__":
+    import os
+
+    world_size = int(os.environ.get('OMPI_COMM_WORLD_SIZE') or 1)
+    world_rank = int(os.environ.get('OMPI_COMM_WORLD_RANK') or 0)
+    coordinator_address = os.environ.get('COORDINATOR_ADDRESS') or 'localhost:11235'
+    print(f'DEBUG rank={world_rank} world_size={world_size}')
+    print(f'DEBUG rank={world_rank} coordinator_address = {coordinator_address}')
+
+    # DEBUG
+    jax.clear_caches()
+
+    jax.distributed.initialize(
+        coordinator_address=coordinator_address,
+        num_processes=world_size,
+        process_id=world_rank,
+    )
+
+    print(f'DEBUG rank={world_rank} jax.device_count()={jax.device_count()}')
+    print(f'DEBUG rank={world_rank} jax.local_device_count()={jax.local_device_count()}')
+    print(f'DEBUG rank={world_rank} jax.devices()={jax.devices()}')
+
+    #jax.profiler.start_server(23456)
     app.run(main)
+    #jax.profiler.stop_server()
+
+    jax.distributed.shutdown()
