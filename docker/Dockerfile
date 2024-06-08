@@ -2,10 +2,17 @@
 # [1] https://github.com/robbyrussell/oh-my-zsh
 # [2] https://github.com/pyenv/pyenv/wiki/common-build-problems
 
-FROM nvidia/cudagl:11.3.1-devel-ubuntu20.04
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
 
 # Needed for string substitution
 SHELL ["/bin/bash", "-c"]
+
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+ENV DEBIAN_FRONTEND=noninteractive
+
+ENV LC_ALL=C.UTF-8
+ENV LANG=C.UTF-8
+
 # Pick up some TF dependencies
 RUN apt-get update && apt-get install -y \
         build-essential \
@@ -37,6 +44,14 @@ RUN source /root/.zshrc && \
     pip install -U pip && \
     pip install setuptools
 
+# OpenGL
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libglvnd-dev \
+    libgl1-mesa-dev \
+    libegl1-mesa-dev \
+    libgles2-mesa-dev
+
 # X window ----------------
 RUN apt-get update && apt-get install -y \
     xvfb x11vnc python-opengl icewm
@@ -61,17 +76,14 @@ RUN source /root/.zshrc && \
 
 # deep ----------------
 RUN source /root/.zshrc && \
-    pip install torch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu113
+    pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
 RUN source /root/.zshrc && \
-    pip install --upgrade "jax[cuda11_pip]==0.4.20" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+    pip install --upgrade "jax[cuda11_local]==0.4.20" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
 # gsutil ----------------
 RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     apt-get update -y && apt-get install google-cloud-sdk -y
-
-ENV LC_ALL=C.UTF-8
-ENV LANG=C.UTF-8
 
 # finalize image  ----------------
 RUN apt-get clean && \

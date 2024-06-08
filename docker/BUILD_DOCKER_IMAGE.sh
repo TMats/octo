@@ -1,9 +1,9 @@
 #!/bin/sh
 
 if [ ! -z $1 ]; then
-  TAG_NAME=$1
+  export TAG_NAME=$1
 else
-  TAG_NAME="latest"
+  export TAG_NAME="latest"
 fi
 
 # Setting up dataset path
@@ -14,4 +14,4 @@ else
   echo "DATASETS_PATH is not set. Using default path: $DATASETS_PATH"
 fi
 
-docker-compose -p octo build ${TAG_NAME}
+docker-compose -p octo build
