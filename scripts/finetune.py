@@ -1,6 +1,5 @@
 import datetime
 from functools import partial
-import imp
 import os
 
 from absl import app, flags, logging
@@ -309,11 +308,13 @@ def main(_):
 
         # Add window_size to top of config, to make eval easier
         new_config = ConfigDict(model.config)
-        new_config["window_size"] = example_batch["observation"]["pad_mask"].shape[1]
+        new_config["window_size"] = example_batch["observation"][
+            "timestep_pad_mask"
+        ].shape[1]
         model = model.replace(config=new_config)
 
         # Save finetuning config since it's not saved by SaveCallback, i.e. as part of model.save_pretrained()
-        with open(
+        with tf.io.gfile.GFile(
             tf.io.gfile.join(save_dir, "finetune_config.json"), "w"
         ) as config_file:
             config_file.write(FLAGS.config.to_json_best_effort())
@@ -342,13 +343,14 @@ def main(_):
         transformer_embeddings = bound_module.octo_transformer(
             batch["observation"],
             batch["task"],
-            batch["observation"]["pad_mask"],
+            batch["observation"]["timestep_pad_mask"],
             train=train,
         )
         action_loss, action_metrics = bound_module.heads["action"].loss(
-            transformer_embeddings,  # Action head knows to pull out the action readout_key
+            transformer_embeddings,  # action head knows to pull out the "action" readout_key
             batch["action"],
-            pad_mask=batch["observation"]["pad_mask"],
+            batch["observation"]["timestep_pad_mask"],
+            batch["action_pad_mask"],
             train=train,
         )
         return action_loss, action_metrics
@@ -369,12 +371,11 @@ def main(_):
         # NotImplementedError: No replication rule for erf_inv. As a workaround, pass the `check_rep=False` argument to `shard_map`
         check_rep=False
     )
-    def train_step(state, batch):
+    def train_step(state: TrainState, batch):
         rng, dropout_rng = jax.random.split(state.rng)
         (loss, info), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             state.model.params, batch, dropout_rng, train=True
         )
-        # Gradient Metrics (TODO: Does the finetuner need these?) ###
         grad_norm = optax.global_norm(grads)
         updates, _ = state.tx.update(grads, state.opt_state, state.model.params)
         update_norm = optax.global_norm(updates)
@@ -386,8 +387,6 @@ def main(_):
                 "learning_rate": lr_callable(state.step),
             }
         )
-        # End Debug Metrics #
-
         new_state = state.apply_gradients(grads=grads, rng=rng)
         return new_state, info
 
@@ -435,10 +434,7 @@ def main(_):
     if "rollout_kwargs" in FLAGS.config:
         rollout_callback = RolloutVisualizationCallback(
             text_processor=text_processor,
-            history_length=FLAGS.config["window_size"],
-            model_pred_horizon=config["model"]["heads"]["action"]["kwargs"].get(
-                "pred_horizon", 1
-            ),
+            unnormalization_statistics=dataset.dataset_statistics["action"],
             **FLAGS.config.rollout_kwargs.to_dict(),
         )
     else:

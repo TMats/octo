@@ -4,18 +4,19 @@ and new action space (bimanual) using a simulated ALOHA cube handover dataset (h
 
 To run this example, first download and extract the dataset from here: https://rail.eecs.berkeley.edu/datasets/example_sim_data.zip
 
-python examples/02_finetune_new_observation_action.py --pretrained_path=hf://rail-berkeley/octo-small --data_dir=...
+python examples/02_finetune_new_observation_action.py --pretrained_path=hf://rail-berkeley/octo-small-1.5 --data_dir=...
 """
 from absl import app, flags, logging
+from functools import partial
 import flax
 import jax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import optax
 import tensorflow as tf
 import tqdm
 import wandb
 
 from octo.data.dataset import make_single_dataset
-from octo.data.utils.data_utils import NormalizationType
 from octo.model.components.action_heads import L1ActionHead
 from octo.model.components.tokenizers import LowdimObsTokenizer
 from octo.model.octo_model import OctoModel
@@ -50,6 +51,14 @@ def main(_):
     ), "Batch size must be divisible by device count."
 
     initialize_compilation_cache()
+
+    # create a 1D mesh with a single axis named "batch"
+    mesh = Mesh(jax.devices(), axis_names="batch")
+    # Our batches will be data-parallel sharded -- each device will get a slice of the batch
+    dp_sharding = NamedSharding(mesh, PartitionSpec("batch"))
+    # Our model will be replicated across devices (we are only doing data parallelism, not model parallelism)
+    replicated_sharding = NamedSharding(mesh, PartitionSpec())
+
     # prevent tensorflow from using GPU memory since it's only used for data loading
     tf.config.set_visible_devices([], "GPU")
 
@@ -70,14 +79,12 @@ def main(_):
             name="aloha_sim_cube_scripted_dataset",
             data_dir=FLAGS.data_dir,
             image_obs_keys={"primary": "top"},
-            state_obs_keys=["state"],
+            proprio_obs_key="state",
             language_key="language_instruction",
-            action_proprio_normalization_type=NormalizationType.NORMAL,
-            absolute_action_mask=[True] * 14,
         ),
         traj_transform_kwargs=dict(
             window_size=1,
-            future_action_window_size=49,  # so we get 50 actions for our action chunk
+            action_horizon=50,
         ),
         frame_transform_kwargs=dict(
             resize_size={"primary": (256, 256)},
@@ -116,10 +123,10 @@ def main(_):
         high=2.0,
         obs_keys=["proprio"],
     )
-    # Fully override the old action head with a new one (for smaller changes, you can use update_module_config)
+    # Fully override the old action head with a new one (for smaller changes, you can use update_config)
     config["model"]["heads"]["action"] = ModuleSpec.create(
         L1ActionHead,
-        pred_horizon=50,
+        action_horizon=50,
         action_dim=14,
         readout_key="readout_action",
     )
@@ -162,18 +169,24 @@ def main(_):
         transformer_embeddings = bound_module.octo_transformer(
             batch["observation"],
             batch["task"],
-            batch["observation"]["pad_mask"],
+            batch["observation"]["timestep_pad_mask"],
             train=train,
         )
         action_loss, action_metrics = bound_module.heads["action"].loss(
             transformer_embeddings,  # Action head knows to pull out the action readout_key
             batch["action"],
-            pad_mask=batch["observation"]["pad_mask"],
+            batch["observation"]["timestep_pad_mask"],
+            batch["action_pad_mask"],
             train=train,
         )
         return action_loss, action_metrics
 
-    @jax.jit
+    # Data parallelism
+    # Model is replicated across devices, data is split across devices
+    @partial(
+        jax.jit,
+        in_shardings=[replicated_sharding, dp_sharding],
+    )
     def train_step(state, batch):
         rng, dropout_rng = jax.random.split(state.rng)
         (loss, info), grads = jax.value_and_grad(loss_fn, has_aux=True)(

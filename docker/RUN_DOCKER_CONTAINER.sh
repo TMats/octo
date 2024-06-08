@@ -2,9 +2,9 @@
 xhost +
 
 if [ ! -z $1 ]; then
-  TAG_NAME=$1
+  export TAG_NAME=$1
 else
-  TAG_NAME="latest"
+  export TAG_NAME="latest"
 fi
 
 # Setting up dataset path
@@ -18,4 +18,4 @@ fi
 # Setting up wandb key
 export WANDB_API_KEY=`cat wandb_key.txt`
 
-docker-compose -p octo up ${TAG_NAME} &
+docker-compose -p octo up &
