@@ -1,6 +1,12 @@
 """Defines dataset mixtures and weights for the Open X-Embodiment Datasets."""
 
 
+HSRTX_MIX = [
+    ("tmc_old", 1.0),
+    ("tmc_new", 1.0),
+    ("u_osaka", 1.0),
+]
+
 BRIDGE_MIX = [
     ("bridge_dataset", 1.0),
 ]

@@ -190,6 +190,10 @@ class ContinuousActionHead(nn.Module, ActionHead):
             mean: Predicted actions w/ shape (batch_size, window_size, pred_horizon, action_dim)
         """
         token_group = transformer_outputs[self.readout_key]
+        print("#####################################################")
+        print(transformer_ouputs)
+        print("#####################################################")
+        print(self.readout_key)
         assert token_group.tokens.ndim == 4, (
             f"Expected token_group.tokens to have shape (batch_size, window_size, num_tokens, embedding_size), "
             f"but got shape {token_group.tokens.shape}"
@@ -207,11 +211,18 @@ class ContinuousActionHead(nn.Module, ActionHead):
         mean = jnp.tanh(mean / self.max_action) * self.max_action
         return mean
 
+    # def loss(
+    #     self,
+    #     transformer_outputs: Dict[str, TokenGroup],
+    #     actions: ArrayLike,
+    #     pad_mask: ArrayLike,
+    #     train: bool = True,
+    # ) -> Tuple[Array, Dict[str, Array]]:
     def loss(
         self,
-        transformer_outputs: Dict[str, TokenGroup],
-        actions: ArrayLike,
-        pad_mask: ArrayLike,
+        transformer_outputs,
+        actions,
+        pad_mask,
         train: bool = True,
     ) -> Tuple[Array, Dict[str, Array]]:
         """Computes the loss for the action regression objective.
@@ -227,7 +238,9 @@ class ContinuousActionHead(nn.Module, ActionHead):
             metrics: dict
         """
         # (batch, window_size, pred_horizon, action_dim)
-        mean = self(transformer_outputs, train=train)
+        # mean = self(transformer_outputs, train=train)
+        mean = transformer_ouputs
+        
 
         window_size = mean.shape[1]
         _check_action_window_size(actions, window_size, self.pred_horizon)
